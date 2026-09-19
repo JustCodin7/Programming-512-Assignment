@@ -173,6 +173,70 @@ def make_table(parent, columns, height=7):
     return tree
 
 
+def make_chart_canvas(parent, height=190):
+    """A lightweight canvas chart: no extra plotting package is required."""
+    canvas = tk.Canvas(parent, height=height, bg=PANEL, highlightthickness=0, bd=0)
+    canvas.pack(fill="x", padx=18, pady=(2, 12))
+    return canvas
+
+
+def draw_bar_chart(canvas, data, title, color=BRASS):
+    """Draw a small responsive bar chart from [(label, value), ...]."""
+    canvas.delete("all")
+    canvas.update_idletasks()
+    width = max(canvas.winfo_width(), 360)
+    height = int(canvas.cget("height"))
+    left, right, top, bottom = 42, 16, 28, 38
+    plot_width, plot_height = width - left - right, height - top - bottom
+    canvas.create_text(0, 6, text=title.upper(), anchor="nw", fill=MUTED, font=("Segoe UI", 9, "bold"))
+    if not data or max(value for _, value in data) == 0:
+        canvas.create_text(width / 2, height / 2, text="No report data yet", fill=MUTED, font=BODY_FONT)
+        return
+    maximum = max(value for _, value in data)
+    for step in range(3):
+        y = top + plot_height * step / 2
+        canvas.create_line(left, y, width - right, y, fill=BORDER, width=1)
+        canvas.create_text(left - 7, y, text=str(round(maximum * (2 - step) / 2)), anchor="e", fill=MUTED, font=("Segoe UI", 8))
+    gap = 12
+    bar_width = max(22, (plot_width - gap * (len(data) + 1)) / len(data))
+    for index, (label, value) in enumerate(data):
+        x1 = left + gap + index * (bar_width + gap)
+        x2 = x1 + bar_width
+        y2 = top + plot_height
+        y1 = y2 - (value / maximum * plot_height)
+        canvas.create_rectangle(x1, y1, x2, y2, fill=color, outline="")
+        canvas.create_text((x1 + x2) / 2, y1 - 8, text=str(value), fill=PARCHMENT, font=("Segoe UI", 9, "bold"))
+        short_label = label if len(label) <= 12 else label[:11] + "…"
+        canvas.create_text((x1 + x2) / 2, y2 + 15, text=short_label, fill=MUTED, font=("Segoe UI", 8))
+
+
+def draw_donut_chart(canvas, values, title):
+    """Draw a compact availability/status donut with a legend."""
+    canvas.delete("all")
+    canvas.update_idletasks()
+    width, height = max(canvas.winfo_width(), 360), int(canvas.cget("height"))
+    canvas.create_text(0, 6, text=title.upper(), anchor="nw", fill=MUTED, font=("Segoe UI", 9, "bold"))
+    total = sum(value for _, value, _ in values)
+    if total == 0:
+        canvas.create_text(width / 2, height / 2, text="No report data yet", fill=MUTED, font=BODY_FONT)
+        return
+    x1, y1, x2, y2 = 18, 30, 155, 167
+    start = 90
+    for label, value, color in values:
+        extent = 360 * value / total
+        canvas.create_arc(x1, y1, x2, y2, start=start, extent=-extent, fill=color, outline=PANEL, width=3, style="pieslice")
+        start -= extent
+    canvas.create_oval(55, 67, 118, 130, fill=PANEL, outline=PANEL)
+    canvas.create_text(86, 88, text=str(total), fill=PARCHMENT, font=("Cambria", 18, "bold"))
+    canvas.create_text(86, 110, text="TOTAL", fill=MUTED, font=("Segoe UI", 8, "bold"))
+    legend_x = 185
+    for index, (label, value, color) in enumerate(values):
+        y = 54 + index * 34
+        canvas.create_oval(legend_x, y, legend_x + 10, y + 10, fill=color, outline="")
+        canvas.create_text(legend_x + 17, y + 5, text=label, anchor="w", fill=PARCHMENT, font=("Segoe UI", 10))
+        canvas.create_text(width - 6, y + 5, text=str(value), anchor="e", fill=PARCHMENT, font=("Segoe UI", 10, "bold"))
+
+
 window = ctk.CTk()
 window.title("Smart Campus Resource Booking System")
 window.geometry("420x480")
@@ -268,18 +332,27 @@ def build_admin_resource_form(dashboard, user):
     make_button(manage_card, "Mark Available", lambda: toggle_status("available"), style="primary")
     make_button(manage_card, "Mark Unavailable", lambda: toggle_status("unavailable"), style="danger")
 
-    report_card = make_card(right, "Campus Report")
-    report_label = ctk.CTkLabel(report_card, text="", justify="left", font=BODY_FONT, text_color=PARCHMENT, anchor="w")
+    report_card = make_card(right, "Campus Insights")
+    report_label = ctk.CTkLabel(report_card, text="Generate a report to see your campus activity.", justify="left", font=BODY_FONT, text_color=MUTED, anchor="w")
     report_label.pack(fill="x", padx=18, pady=(0, 10))
+    usage_chart = make_chart_canvas(report_card)
+    availability_chart = make_chart_canvas(report_card, height=170)
 
     def show_report():
         report = get_campus_report(user.campus_id)
         report_text = (
-            f"Total bookings: {report['total_bookings']}\n"
-            f"Most used resource: {report['most_used_resource']}\n"
-            f"Average booking duration: {report['avg_duration']} minutes"
+            f"{report['total_bookings']} bookings recorded · most used: {report['most_used_resource']} · "
+            f"average duration: {report['avg_duration']} min"
         )
         report_label.configure(text=report_text)
+        bookings = get_bookings_by_campus(user.campus_id)
+        usage = {}
+        for booking in bookings:
+            usage[booking["resource_name"]] = usage.get(booking["resource_name"], 0) + 1
+        draw_bar_chart(usage_chart, sorted(usage.items(), key=lambda item: item[1], reverse=True)[:5], "Bookings by resource")
+        resources = get_all_resources_by_campus(user.campus_id)
+        available = sum(resource["status"] == "available" for resource in resources)
+        draw_donut_chart(availability_chart, [("Available", available, SUCCESS), ("Unavailable", len(resources) - available, BRICK)], "Resource availability")
 
     make_button(report_card, "Generate Report", show_report, style="primary")
 
@@ -399,9 +472,10 @@ def build_operator_view(dashboard, user):
     for b in get_all_bookings():
         bookings_listbox.insert("", "end", values=(b['campus_name'], b['resource_name'], b['lecturer_name'], f"{b['booking_date']} · {b['start_time']}", b['status'].title()), tags=(b['status'].lower(),))
 
-    report_card = make_card(right, "Cross-Campus Comparison")
-    report_label = ctk.CTkLabel(report_card, text="", justify="left", font=BODY_FONT, text_color=PARCHMENT, anchor="w")
+    report_card = make_card(right, "Cross-Campus Insights")
+    report_label = ctk.CTkLabel(report_card, text="Generate a report to compare campus activity.", justify="left", font=BODY_FONT, text_color=MUTED, anchor="w")
     report_label.pack(fill="x", padx=18, pady=(0, 10))
+    comparison_chart = make_chart_canvas(report_card, height=205)
 
     def show_cross_report():
         lines = []
@@ -409,6 +483,7 @@ def build_operator_view(dashboard, user):
             avg = round(row["avg_duration"], 1) if row["avg_duration"] is not None else "N/A"
             lines.append(f"{row['name']}: {row['total_bookings']} bookings, avg duration {avg} min")
         report_label.configure(text="\n".join(lines))
+        draw_bar_chart(comparison_chart, [(row["name"], row["total_bookings"]) for row in get_cross_campus_report()], "Bookings by campus", SUCCESS)
 
     make_button(report_card, "Generate Comparison Report", show_cross_report, style="primary")
 
