@@ -237,21 +237,6 @@ def draw_donut_chart(canvas, values, title):
         canvas.create_text(width - 6, y + 5, text=str(value), anchor="e", fill=PARCHMENT, font=("Segoe UI", 10, "bold"))
 
 
-window = ctk.CTk()
-window.title("Smart Campus Resource Booking System")
-window.geometry("420x480")
-window.configure(fg_color=INK)
-configure_table_style(window)
-
-login_card = ctk.CTkFrame(window, fg_color=PANEL, corner_radius=16, border_width=1, border_color=BORDER)
-login_card.pack(expand=True, padx=30, pady=40, fill="both")
-
-ctk.CTkLabel(
-    login_card, text="Smart Campus", font=HEADING_FONT, text_color=BRASS,
-).pack(pady=(30, 0))
-ctk.CTkLabel(
-    login_card, text="Resource Booking System", font=LABEL_FONT, text_color=MUTED,
-).pack(pady=(0, 25))
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +274,7 @@ def build_admin_resource_form(dashboard, user):
             name_entry.delete(0, tk.END)
             type_entry.delete(0, tk.END)
             refresh_resources()
+            show_report()
         else:
             messagebox.showerror("Error", message)
 
@@ -326,6 +312,7 @@ def build_admin_resource_form(dashboard, user):
         if success:
             messagebox.showinfo("Success", message)
             refresh_resources()
+            show_report()
         else:
             messagebox.showerror("Error", message)
 
@@ -355,6 +342,62 @@ def build_admin_resource_form(dashboard, user):
         draw_donut_chart(availability_chart, [("Available", available, SUCCESS), ("Unavailable", len(resources) - available, BRICK)], "Resource availability")
 
     make_button(report_card, "Generate Report", show_report, style="primary")
+
+    def auto_refresh_report():
+        """Keep an open dashboard accurate when data changes in the database."""
+        if report_card.winfo_exists():
+            show_report()
+            report_card.after(15000, auto_refresh_report)
+
+    report_card.after(15000, auto_refresh_report)
+
+    campus = get_campus(user.campus_id)
+    if campus["priority_override"]:
+        priority_card = make_card(left, "Priority Booking (Override)")
+        ctk.CTkLabel(
+            priority_card,
+            text="This campus allows an admin booking to override an existing\nlecturer booking, but only with 24+ hours' notice.",
+            font=LABEL_FONT, text_color=MUTED, justify="left", anchor="w",
+        ).pack(fill="x", padx=18, pady=(0, 10))
+
+        priority_resources = get_resources_by_campus(user.campus_id)
+        priority_resource_table = make_table(priority_card, [("code", "Code"), ("name", "Name")], height=4)
+        for r in priority_resources:
+            priority_resource_table.insert("", "end", values=(r["resource_code"], r["name"]))
+
+        p_date_entry = make_field(priority_card, "Date (YYYY-MM-DD)")
+        p_time_entry = make_field(priority_card, "Start Time (HH:MM, 24hr)")
+        p_duration_entry = make_field(priority_card, "Duration (minutes)")
+
+        def submit_priority_booking():
+            selection = priority_resource_table.selection()
+            if not selection:
+                messagebox.showerror("Error", "Please select a resource first.")
+                return
+            selected_resource = priority_resources[priority_resource_table.index(selection[0])]
+            try:
+                duration = int(p_duration_entry.get())
+            except ValueError:
+                messagebox.showerror("Error", "Duration must be a whole number of minutes.")
+                return
+
+            success, message = create_booking(
+                resource_id=selected_resource["resource_id"],
+                lecturer_id=user.user_id,
+                campus_id=user.campus_id,
+                booking_date=p_date_entry.get().strip(),
+                start_time=p_time_entry.get().strip(),
+                duration_minutes=duration,
+                requesting_role="admin",
+            )
+            if success:
+                messagebox.showinfo("Success", message)
+                refresh_campus_bookings()
+                show_report()
+            else:
+                messagebox.showerror("Booking Failed", message)
+
+        make_button(priority_card, "Book / Override", submit_priority_booking, style="danger")
 
     refresh_campus_bookings()
     refresh_resources()
@@ -487,6 +530,13 @@ def build_operator_view(dashboard, user):
 
     make_button(report_card, "Generate Comparison Report", show_cross_report, style="primary")
 
+    def auto_refresh_cross_report():
+        if report_card.winfo_exists():
+            show_cross_report()
+            report_card.after(15000, auto_refresh_cross_report)
+
+    report_card.after(15000, auto_refresh_cross_report)
+
 
 # ---------------------------------------------------------------------------
 # DASHBOARD ROUTER
@@ -512,6 +562,11 @@ def open_dashboard(user):
     ctk.CTkLabel(greeting, text=f"Welcome back, {user.full_name.split()[0]}", font=HEADING_FONT, text_color=PARCHMENT, anchor="w").pack(fill="x")
     ctk.CTkLabel(greeting, text=f"SMART CAMPUS  /  {user.role_name().upper()}", font=("Segoe UI", 10, "bold"), text_color=BRASS, anchor="w").pack(fill="x", pady=(2, 0))
     ctk.CTkLabel(header, text="Resource Booking", font=("Cambria", 16, "bold"), text_color=MUTED).pack(side="right", padx=8)
+    ctk.CTkButton(
+        header, text="Logout", command=lambda: logout(dashboard),
+        fg_color="transparent", hover_color=PANEL_LIGHT, border_width=1, border_color=BRICK,
+        text_color=BRICK, font=LABEL_FONT, corner_radius=8, width=80,
+    ).pack(side="right", padx=8)
 
     metrics = ctk.CTkFrame(content, fg_color="transparent")
     metrics.pack(fill="x", padx=15, pady=(0, 18))
@@ -629,20 +684,44 @@ def check_login():
     open_dashboard(user)
 
 
-username_entry = make_field(login_card, "Username")
-password_entry_label = ctk.CTkLabel(login_card, text="Password", font=LABEL_FONT, text_color=MUTED, anchor="w")
-password_entry_label.pack(fill="x", padx=18, pady=(4, 0))
-password_entry = ctk.CTkEntry(
-    login_card, show="*", fg_color=PANEL_LIGHT, border_color=BORDER, text_color=PARCHMENT,
-    font=BODY_FONT, corner_radius=8,
-)
-password_entry.pack(fill="x", padx=18, pady=(2, 20))
+def build_login_window():
+    """Builds (or rebuilds, after logout) the login screen."""
+    global window, username_entry, password_entry
 
-make_button(login_card, "Login", check_login, style="primary")
-ctk.CTkButton(
-    login_card, text="Register New Account", command=open_register_window,
-    fg_color="transparent", hover_color=PANEL_LIGHT, border_width=1, border_color=BRASS,
-    text_color=BRASS, font=BODY_FONT, corner_radius=8,
-).pack(fill="x", padx=18, pady=(0, 20))
+    window = ctk.CTk()
+    window.title("Smart Campus Resource Booking System")
+    window.geometry("420x480")
+    window.configure(fg_color=INK)
+    configure_table_style(window)
 
-window.mainloop()
+    login_card = ctk.CTkFrame(window, fg_color=PANEL, corner_radius=16, border_width=1, border_color=BORDER)
+    login_card.pack(expand=True, padx=30, pady=40, fill="both")
+
+    ctk.CTkLabel(login_card, text="Smart Campus", font=HEADING_FONT, text_color=BRASS).pack(pady=(30, 0))
+    ctk.CTkLabel(login_card, text="Resource Booking System", font=LABEL_FONT, text_color=MUTED).pack(pady=(0, 25))
+
+    username_entry = make_field(login_card, "Username")
+    password_entry_label = ctk.CTkLabel(login_card, text="Password", font=LABEL_FONT, text_color=MUTED, anchor="w")
+    password_entry_label.pack(fill="x", padx=18, pady=(4, 0))
+    password_entry = ctk.CTkEntry(
+        login_card, show="*", fg_color=PANEL_LIGHT, border_color=BORDER, text_color=PARCHMENT,
+        font=BODY_FONT, corner_radius=8,
+    )
+    password_entry.pack(fill="x", padx=18, pady=(2, 20))
+
+    make_button(login_card, "Login", check_login, style="primary")
+    ctk.CTkButton(
+        login_card, text="Register New Account", command=open_register_window,
+        fg_color="transparent", hover_color=PANEL_LIGHT, border_width=1, border_color=BRASS,
+        text_color=BRASS, font=BODY_FONT, corner_radius=8,
+    ).pack(fill="x", padx=18, pady=(0, 20))
+
+    window.mainloop()
+
+
+def logout(dashboard):
+    dashboard.destroy()
+    build_login_window()
+
+
+build_login_window()

@@ -209,6 +209,16 @@ def get_all_resources_by_campus(campus_id):
     return rows
 
 
+def get_resource(resource_id):
+    """Fetch one resource row by id (used to double-check its status before booking)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM resources WHERE resource_id = ?", (resource_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+
 def get_all_resources():
     """Every resource, across every campus (for the System Operator)."""
     conn = get_connection()
@@ -281,25 +291,47 @@ def is_slot_available(resource_id, booking_date, start_time, duration_minutes):
     return True
 
 
-def create_booking(resource_id, lecturer_id, campus_id, booking_date, start_time, duration_minutes):
+def create_booking(resource_id, lecturer_id, campus_id, booking_date, start_time, duration_minutes, requesting_role="lecturer"):
     """Create a booking, but only after validating the input and checking
     it against the campus's own booking policy and existing bookings.
+
+    At a campus with priority_override enabled (Johannesburg), an admin or
+    operator's booking can bump an existing lecturer booking that overlaps
+    it - but only if that existing booking starts more than 24 hours from
+    now, so the lecturer isn't bumped with no notice. Regular lecturer
+    bookings never get this override; they follow the normal overlap rule.
+
     Returns (True, message) or (False, message)."""
 
     if duration_minutes <= 0:
         return False, "Duration must be greater than 0 minutes."
 
     try:
-        datetime.datetime.strptime(booking_date, "%Y-%m-%d")
+        parsed_date = datetime.datetime.strptime(booking_date, "%Y-%m-%d")
+        # Normalize to zero-padded form (e.g. "2026-8-7" -> "2026-08-07").
+        # SQLite has no real date type - it sorts booking_date as plain text,
+        # so an unpadded date would sort in the wrong position relative to
+        # padded ones (e.g. "2026-08-7" sorts AFTER "2026-08-12" as text).
+        booking_date = parsed_date.strftime("%Y-%m-%d")
     except ValueError:
         return False, "Date must be in YYYY-MM-DD format (e.g. 2026-10-01)."
 
     try:
         start_minutes = _time_to_minutes(start_time)
+        # Same normalization for time, for the same text-sorting reason
+        # (e.g. "9:00" would otherwise sort AFTER "10:00" as text).
+        start_time = f"{start_minutes // 60:02d}:{start_minutes % 60:02d}"
     except (ValueError, AttributeError):
         return False, "Start time must be in HH:MM format (e.g. 14:30)."
 
     campus = get_campus(campus_id)
+
+    # A resource marked unavailable can't be booked, even if a caller
+    # somehow has its resource_id - the Lecturer's list already filters
+    # these out, but that's a GUI convenience, not a real guarantee.
+    resource = get_resource(resource_id)
+    if resource is None or resource["status"] != "available":
+        return False, "This resource is not available for booking."
 
     # Campus-specific rule: maximum booking duration (0 = no cap, e.g. Johannesburg).
     if campus["max_duration_minutes"] > 0 and duration_minutes > campus["max_duration_minutes"]:
@@ -313,9 +345,17 @@ def create_booking(resource_id, lecturer_id, campus_id, booking_date, start_time
     if start_minutes < open_minutes or end_minutes > close_minutes:
         return False, f"Bookings must fall within {campus['open_hour']}:00 - {campus['close_hour']}:00."
 
-    # No double-booking the same resource.
+    # No double-booking the same resource - unless this is a priority
+    # override at a campus that allows it.
     if not is_slot_available(resource_id, booking_date, start_time, duration_minutes):
-        return False, "This resource is already booked for an overlapping time."
+        if campus["priority_override"] and requesting_role in ("admin", "operator"):
+            overridden, override_message = _override_conflicting_bookings(
+                resource_id, booking_date, start_time, duration_minutes
+            )
+            if not overridden:
+                return False, override_message
+        else:
+            return False, "This resource is already booked for an overlapping time."
 
     conn = get_connection()
     cursor = conn.cursor()
@@ -327,6 +367,49 @@ def create_booking(resource_id, lecturer_id, campus_id, booking_date, start_time
     conn.commit()
     conn.close()
     return True, "Booking created successfully."
+
+
+def _override_conflicting_bookings(resource_id, booking_date, start_time, duration_minutes):
+    """Cancel every active booking that overlaps the requested slot, but only
+    if every single one of them starts more than 24 hours from now. If even
+    one is too close, nothing is cancelled and the whole override is refused -
+    it's all-or-nothing, so a lecturer is never partially bumped."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """SELECT * FROM bookings
+           WHERE resource_id = ? AND booking_date = ? AND status = 'active'""",
+        (resource_id, booking_date),
+    )
+    existing_bookings = cursor.fetchall()
+
+    new_start = _time_to_minutes(start_time)
+    new_end = new_start + duration_minutes
+
+    overlapping = []
+    for booking in existing_bookings:
+        existing_start = _time_to_minutes(booking["start_time"])
+        existing_end = existing_start + booking["duration_minutes"]
+        if new_start < existing_end and existing_start < new_end:
+            overlapping.append(booking)
+
+    now = datetime.datetime.now()
+    for booking in overlapping:
+        booking_start = datetime.datetime.strptime(
+            f"{booking['booking_date']} {booking['start_time']}", "%Y-%m-%d %H:%M"
+        )
+        if booking_start - now < datetime.timedelta(hours=24):
+            conn.close()
+            return False, "Cannot override: an existing booking starts within the next 24 hours."
+
+    for booking in overlapping:
+        cursor.execute(
+            "UPDATE bookings SET status = 'cancelled' WHERE booking_id = ?",
+            (booking["booking_id"],),
+        )
+    conn.commit()
+    conn.close()
+    return True, ""
 
 
 def get_bookings_by_lecturer(lecturer_id):
