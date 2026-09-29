@@ -11,6 +11,9 @@ manually - this is what protects the app against SQL injection.
 import sqlite3
 import datetime
 import os
+import re
+
+from policies import BookingPolicy, OVERRIDE_NOTICE_HOURS, MAX_ADVANCE_DAYS
 
 # Store the database file next to this script, not wherever the terminal
 # happens to be pointed - avoids ever accidentally creating/reading a
@@ -49,7 +52,10 @@ def initialize_database():
 
     # CAMPUSES - each row carries its own booking policy values, so adding
     # a new campus with different rules never requires changing any code,
-    # just inserting a new row (see _seed_campuses below).
+    # just inserting a new row (see _seed_campuses below). The rules
+    # themselves (max duration, operating hours, priority access) are
+    # enforced by the BookingPolicy class and rule functions in policies.py,
+    # kept separate from this file's booking logic (brief section 5.2).
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS campuses (
             campus_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,7 +100,139 @@ def initialize_database():
 
     conn.commit()
     _seed_campuses(cursor, conn)
+    first_run = _seed_demo_users(cursor, conn)
     conn.close()
+
+    # Sample resources + bookings are only added on the very first run (when
+    # the demo accounts were just created), so nothing is ever duplicated and
+    # nothing an admin later deletes comes back.
+    if first_run:
+        _seed_sample_data()
+
+
+def _seed_demo_users(cursor, conn):
+    """Create one demo account per role (only once) so the app is fully
+    testable the moment it's unzipped, without needing to manually poke
+    the database. The GUI's own registration form only ever creates
+    lecturer accounts on purpose (see open_register_window in gui.py) -
+    admin/operator accounts aren't meant to be something anyone can just
+    sign up for, so these demo accounts (one lecturer, one administrator
+    per campus, one operator) are the only way to reach those roles from
+    a fresh database."""
+    cursor.execute("SELECT COUNT(*) FROM users")
+    if cursor.fetchone()[0] > 0:
+        return False  # already seeded - don't duplicate on every run
+
+    from auth import hash_password
+
+    # campus_id 1 = Cape Town, 2 = Durban, 3 = Johannesburg (see _seed_campuses)
+    demo_accounts = [
+        ("lecturer1", "Password123", "lecturer", "Demo Lecturer", 1),
+        # one administrator per campus (brief 3.2: an admin manages ONE
+        # specific campus) - admin3 is the only one who sees the priority
+        # booking tool, because only Johannesburg has that rule switched on
+        ("admin1",    "Password123", "admin",    "Demo Administrator (Cape Town)", 1),
+        ("admin2",    "Password123", "admin",    "Demo Administrator (Durban)", 2),
+        ("admin3",    "Password123", "admin",    "Demo Administrator (Johannesburg)", 3),
+        ("operator1", "Password123", "operator", "Demo System Operator", None),
+    ]
+    for username, password, role, full_name, campus_id in demo_accounts:
+        password_hash, salt = hash_password(password)
+        cursor.execute(
+            """INSERT INTO users (username, password_hash, salt, role, full_name, campus_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (username, password_hash, salt, role, full_name, campus_id),
+        )
+    conn.commit()
+    return True
+
+
+def _seed_sample_data():
+    """Give a brand-new database some realistic starting data (resources at
+    all three campuses, plus a few bookings) so every screen and report has
+    something to show straight away.
+
+    Everything goes through add_resource() and create_booking(), i.e. the
+    same validation and campus booking rules as real use, so the sample data
+    can never break a rule. Booking dates are worked out from today's date,
+    so they are always in the future however long after this was written
+    the app is first run."""
+    # (campus_id, code, name, type) - the types deliberately overlap between
+    # campuses (Lab / Projector / Room) but not completely (Equipment only
+    # exists in Cape Town + Durban, Auditorium only in Johannesburg), which
+    # is what the operator's "offered at every campus / only at ..."
+    # comparison shows off.
+    resources = [
+        (1, "CT-LAB-01",   "Computer Lab A",          "Lab"),
+        (1, "CT-PROJ-01",  "Portable Projector 1",    "Projector"),
+        (1, "CT-ROOM-01",  "Seminar Room 1A",         "Room"),
+        (1, "CT-EQ-01",    "Video Camera Kit",        "Equipment"),
+        (2, "DBN-LAB-01",  "Computer Lab B",          "Lab"),
+        (2, "DBN-PROJ-01", "Ceiling Projector, Room 4", "Projector"),
+        (2, "DBN-ROOM-01", "Seminar Room 2B",         "Room"),
+        (2, "DBN-EQ-01",   "Presentation Kit (mic + screen)", "Equipment"),
+        (3, "JHB-LAB-01",  "Computer Lab C",          "Lab"),
+        (3, "JHB-PROJ-01", "Portable Projector 2",    "Projector"),
+        (3, "JHB-ROOM-01", "Boardroom",               "Room"),
+        (3, "JHB-AUD-01",  "Main Auditorium",         "Auditorium"),
+    ]
+    for campus_id, code, name, resource_type in resources:
+        add_resource(campus_id, code, name, resource_type)
+
+    conn = get_connection()
+    ids = {r["username"]: r["user_id"] for r in conn.execute("SELECT user_id, username FROM users")}
+    codes = {r["resource_code"]: r["resource_id"] for r in conn.execute("SELECT resource_id, resource_code FROM resources")}
+    conn.close()
+
+    today = datetime.date.today()
+    day = lambda n: (today + datetime.timedelta(days=n)).isoformat()
+
+    # (resource code, campus_id, days from today, start, minutes, booked by, role)
+    bookings = [
+        ("CT-LAB-01",   1, 3,  "09:00", 90,  "lecturer1", "lecturer"),
+        ("CT-PROJ-01",  1, 3,  "13:00", 60,  "lecturer1", "lecturer"),
+        ("CT-LAB-01",   1, 5,  "10:00", 120, "lecturer1", "lecturer"),
+        ("DBN-ROOM-01", 2, 4,  "10:00", 150, "lecturer1", "lecturer"),
+        ("DBN-LAB-01",  2, 6,  "09:30", 180, "lecturer1", "lecturer"),
+        ("JHB-AUD-01",  3, 7,  "08:00", 300, "lecturer1", "lecturer"),
+        ("JHB-LAB-01",  3, 9,  "14:00", 240, "lecturer1", "lecturer"),
+        ("JHB-ROOM-01", 3, 10, "11:00", 60,  "admin3",     "admin"),
+    ]
+    for code, campus_id, offset, start, minutes, username, role in bookings:
+        create_booking(codes[code], ids[username], campus_id, day(offset), start, minutes, role)
+
+    # A little booking HISTORY, so "past bookings" has something to show on a
+    # brand-new database. create_booking() (rightly) refuses dates in the
+    # past, so these two are inserted directly - they still respect every
+    # campus rule (hours and max duration).
+    history = [
+        ("CT-LAB-01",   1, -3, "09:00", 60),
+        ("DBN-PROJ-01", 2, -1, "11:00", 90),
+    ]
+    conn = get_connection()
+    for code, campus_id, offset, start, minutes in history:
+        conn.execute(
+            """INSERT INTO bookings (resource_id, lecturer_id, campus_id, booking_date, start_time, duration_minutes)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (codes[code], ids["lecturer1"], campus_id, day(offset), start, minutes),
+        )
+    conn.commit()
+    conn.close()
+
+    # one cancelled booking, so the cancellation figures in the reports
+    # aren't all zero
+    create_booking(codes["CT-EQ-01"], ids["lecturer1"], 1, day(12), "15:00", 45, "lecturer")
+    conn = get_connection()
+    booking_id = conn.execute(
+        "SELECT booking_id FROM bookings WHERE resource_id = ? AND booking_date = ?",
+        (codes["CT-EQ-01"], day(12)),
+    ).fetchone()["booking_id"]
+    conn.close()
+    cancel_booking(booking_id, ids["lecturer1"])
+
+    # one resource marked unavailable, so the availability chart and the
+    # "hidden from lecturers" behaviour can be seen
+    set_resource_status(codes["JHB-PROJ-01"], 3, "unavailable")
 
 
 def _seed_campuses(cursor, conn):
@@ -126,11 +264,34 @@ def create_user(username, password, role, full_name, campus_id=None):
     Returns (True, message) on success or (False, message) on failure -
     e.g. if the username is already taken."""
     from auth import hash_password
+
+    # --- validate everything first, so bad input gets a clear message and
+    # never reaches the database ---
+    username = (username or "").strip()
+    full_name = (full_name or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{3,30}", username):
+        return False, "Username must be 3-30 characters: letters, numbers, dots, hyphens or underscores (no spaces)."
+    if not password or len(password) < 6:
+        return False, "Password must be at least 6 characters long."
+    if len(password) > 100:
+        return False, "Password can't be longer than 100 characters."
+    if not 2 <= len(full_name) <= 80:
+        return False, "Full name must be between 2 and 80 characters."
+    if role not in ("lecturer", "admin", "operator"):
+        return False, "Invalid account role."
+    if role != "operator" and get_campus(campus_id) is None:
+        return False, "Please choose a valid campus."
+
     password_hash, salt = hash_password(password)
 
     conn = get_connection()
     cursor = conn.cursor()
     try:
+        # usernames are treated as case-insensitive, so "Bob" and "bob"
+        # can't exist as two different accounts
+        cursor.execute("SELECT 1 FROM users WHERE LOWER(username) = LOWER(?)", (username,))
+        if cursor.fetchone():
+            return False, "That username is already taken."
         cursor.execute(
             """INSERT INTO users (username, password_hash, salt, role, full_name, campus_id)
                VALUES (?, ?, ?, ?, ?, ?)""",
@@ -169,7 +330,21 @@ def get_campus(campus_id):
 # ---------------------------------------------------------------------------
 
 def add_resource(campus_id, resource_code, name, resource_type):
-    """Add a new resource to a campus. Returns (True, message) or (False, message)."""
+    """Add a new resource to a campus. Returns (True, message) or (False, message).
+    The code is tidied up to upper-case so "ct-lab-1" and "CT-LAB-1" can't
+    both exist as different resources."""
+    resource_code = (resource_code or "").strip().upper()
+    name = (name or "").strip()
+    resource_type = (resource_type or "").strip().title()
+    if not re.fullmatch(r"[A-Z0-9][A-Z0-9_-]{1,19}", resource_code):
+        return False, "Resource code must be 2-20 characters: letters, numbers, hyphens or underscores (e.g. CT-LAB-02)."
+    if not 1 <= len(name) <= 60:
+        return False, "Resource name must be between 1 and 60 characters."
+    if not 1 <= len(resource_type) <= 30:
+        return False, "Resource type must be between 1 and 30 characters."
+    if get_campus(campus_id) is None:
+        return False, "Campus not found."
+
     conn = get_connection()
     cursor = conn.cursor()
     try:
@@ -238,6 +413,8 @@ def set_resource_status(resource_id, campus_id, status):
     own campus. We never hard-delete a resource, since that would break the
     booking history and reports tied to it; 'removing' a resource means
     hiding it from lecturers, not erasing its records."""
+    if status not in ("available", "unavailable"):
+        return False, "Status must be 'available' or 'unavailable'."
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
@@ -253,14 +430,87 @@ def set_resource_status(resource_id, campus_id, status):
     return True, f"Resource marked as {status}."
 
 
+def delete_resource(resource_id, campus_id):
+    """Permanently remove a resource - only if it belongs to this admin's
+    own campus AND has no booking history at all (past or present). This
+    is a genuine hard delete, unlike set_resource_status() above.
+
+    We refuse to delete a resource that has any bookings, active or
+    cancelled, because bookings.resource_id has a FOREIGN KEY pointing at
+    it - deleting it anyway would either fail outright or silently break
+    every report and booking-history record tied to it. In that case an
+    admin should use set_resource_status() to mark it unavailable instead,
+    which keeps the history intact but stops it being booked again.
+
+    Returns (True, message) on a successful delete, or (False, message)
+    explaining why it couldn't be deleted."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT COUNT(*) FROM bookings WHERE resource_id = ?", (resource_id,)
+    )
+    booking_count = cursor.fetchone()[0]
+    if booking_count > 0:
+        conn.close()
+        return False, (
+            f"Can't permanently remove this resource - it has {booking_count} "
+            "booking(s) on record. Mark it unavailable instead to hide it "
+            "without losing booking history."
+        )
+
+    cursor.execute(
+        "DELETE FROM resources WHERE resource_id = ? AND campus_id = ?",
+        (resource_id, campus_id),
+    )
+    conn.commit()
+    rows_changed = cursor.rowcount
+    conn.close()
+
+    if rows_changed == 0:
+        return False, "Resource not found at your campus."
+    return True, "Resource permanently removed."
+
+
+def update_resource(resource_id, campus_id, name, resource_type):
+    """Update a resource's name and type - only if it belongs to this admin's
+    own campus. The resource_code is left alone on purpose: it's the stable
+    identifier other records (bookings, reports) implicitly rely on, so it
+    shouldn't change after creation - only the descriptive details can."""
+    name = (name or "").strip()
+    resource_type = (resource_type or "").strip().title()
+    if not 1 <= len(name) <= 60:
+        return False, "Resource name must be between 1 and 60 characters."
+    if not 1 <= len(resource_type) <= 30:
+        return False, "Resource type must be between 1 and 30 characters."
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE resources SET name = ?, resource_type = ? WHERE resource_id = ? AND campus_id = ?",
+        (name, resource_type, resource_id, campus_id),
+    )
+    conn.commit()
+    rows_changed = cursor.rowcount
+    conn.close()
+
+    if rows_changed == 0:
+        return False, "Resource not found at your campus."
+    return True, "Resource updated successfully."
+
+
 # ---------------------------------------------------------------------------
 # BOOKINGS
 # ---------------------------------------------------------------------------
 
 def _time_to_minutes(time_str):
-    """Turn '14:30' into 870 (minutes since midnight) so times are easy to compare."""
-    hours, minutes = time_str.split(":")
-    return int(hours) * 60 + int(minutes)
+    """Turn '14:30' into 870 (minutes since midnight) so times are easy to compare.
+    Raises ValueError for anything that isn't a real time of day (so "9:60"
+    or "-1:30" are rejected instead of quietly turning into another time)."""
+    hours, minutes = time_str.strip().split(":")
+    hours, minutes = int(hours), int(minutes)
+    if not (0 <= hours <= 23 and 0 <= minutes <= 59):
+        raise ValueError("time out of range")
+    return hours * 60 + minutes
 
 
 def is_slot_available(resource_id, booking_date, start_time, duration_minutes):
@@ -324,7 +574,23 @@ def create_booking(resource_id, lecturer_id, campus_id, booking_date, start_time
     except (ValueError, AttributeError):
         return False, "Start time must be in HH:MM format (e.g. 14:30)."
 
+    # No bookings in the past (they could never be cancelled either, since
+    # only future bookings can be cancelled), and none absurdly far ahead.
+    start_datetime = datetime.datetime.strptime(f"{booking_date} {start_time}", "%Y-%m-%d %H:%M")
+    now = datetime.datetime.now()
+    if start_datetime <= now:
+        return False, "Bookings can't be made in the past - please choose a future date and time."
+    if start_datetime > now + datetime.timedelta(days=MAX_ADVANCE_DAYS):
+        return False, f"Bookings can only be made up to {MAX_ADVANCE_DAYS} days in advance."
+
     campus = get_campus(campus_id)
+    if campus is None:
+        return False, "Campus not found."
+
+    # All of this campus's booking rules live in policies.py, not here -
+    # this function just asks the policy object and doesn't need to know
+    # what any individual rule actually is (brief section 5.2).
+    policy = BookingPolicy.from_campus(campus)
 
     # A resource marked unavailable can't be booked, even if a caller
     # somehow has its resource_id - the Lecturer's list already filters
@@ -333,22 +599,21 @@ def create_booking(resource_id, lecturer_id, campus_id, booking_date, start_time
     if resource is None or resource["status"] != "available":
         return False, "This resource is not available for booking."
 
-    # Campus-specific rule: maximum booking duration (0 = no cap, e.g. Johannesburg).
-    if campus["max_duration_minutes"] > 0 and duration_minutes > campus["max_duration_minutes"]:
-        return False, f"This campus's max booking duration is {campus['max_duration_minutes']} minutes."
+    # A booking is linked to the campus the lecturer selected (brief 4.3),
+    # so the resource has to genuinely be at that campus.
+    if resource["campus_id"] != campus_id:
+        return False, "That resource doesn't belong to the selected campus."
 
-    # Campus-specific rule: booking must fall entirely within operating hours.
-    end_minutes = start_minutes + duration_minutes
-    open_minutes = campus["open_hour"] * 60
-    close_minutes = campus["close_hour"] * 60
-
-    if start_minutes < open_minutes or end_minutes > close_minutes:
-        return False, f"Bookings must fall within {campus['open_hour']}:00 - {campus['close_hour']}:00."
+    # Campus-specific rules (max duration, operating hours, and any rule
+    # added to BOOKING_RULES in future) are all checked in one call.
+    rule_violation = policy.check_booking(start_minutes, duration_minutes)
+    if rule_violation:
+        return False, rule_violation
 
     # No double-booking the same resource - unless this is a priority
     # override at a campus that allows it.
     if not is_slot_available(resource_id, booking_date, start_time, duration_minutes):
-        if campus["priority_override"] and requesting_role in ("admin", "operator"):
+        if policy.allows_override(requesting_role):
             overridden, override_message = _override_conflicting_bookings(
                 resource_id, booking_date, start_time, duration_minutes
             )
@@ -358,14 +623,20 @@ def create_booking(resource_id, lecturer_id, campus_id, booking_date, start_time
             return False, "This resource is already booked for an overlapping time."
 
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        """INSERT INTO bookings (resource_id, lecturer_id, campus_id, booking_date, start_time, duration_minutes)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (resource_id, lecturer_id, campus_id, booking_date, start_time, duration_minutes),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            """INSERT INTO bookings (resource_id, lecturer_id, campus_id, booking_date, start_time, duration_minutes)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (resource_id, lecturer_id, campus_id, booking_date, start_time, duration_minutes),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # e.g. the lecturer account doesn't exist. Without this, the error
+        # would escape with the connection still open and the database
+        # locked for every save after it.
+        return False, "Couldn't save the booking - the lecturer or resource no longer exists."
+    finally:
+        conn.close()
     return True, "Booking created successfully."
 
 
@@ -398,9 +669,9 @@ def _override_conflicting_bookings(resource_id, booking_date, start_time, durati
         booking_start = datetime.datetime.strptime(
             f"{booking['booking_date']} {booking['start_time']}", "%Y-%m-%d %H:%M"
         )
-        if booking_start - now < datetime.timedelta(hours=24):
+        if booking_start - now < datetime.timedelta(hours=OVERRIDE_NOTICE_HOURS):
             conn.close()
-            return False, "Cannot override: an existing booking starts within the next 24 hours."
+            return False, f"Cannot override: an existing booking starts within the next {OVERRIDE_NOTICE_HOURS} hours."
 
     for booking in overlapping:
         cursor.execute(
@@ -413,13 +684,18 @@ def _override_conflicting_bookings(resource_id, booking_date, start_time, durati
 
 
 def get_bookings_by_lecturer(lecturer_id):
-    """Return all bookings made by this lecturer, with the resource name attached."""
+    """Return all bookings made by this lecturer, with the resource name and
+    campus name attached. The campus matters because a lecturer can select
+    and book at any campus (brief section 3.1), so their history needs to
+    show WHICH campus each booking belongs to."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        """SELECT bookings.*, resources.name AS resource_name, resources.resource_code
+        """SELECT bookings.*, resources.name AS resource_name, resources.resource_code,
+                  campuses.name AS campus_name
            FROM bookings
            JOIN resources ON bookings.resource_id = resources.resource_id
+           JOIN campuses ON bookings.campus_id = campuses.campus_id
            WHERE bookings.lecturer_id = ?
            ORDER BY bookings.booking_date, bookings.start_time""",
         (lecturer_id,),
@@ -430,12 +706,34 @@ def get_bookings_by_lecturer(lecturer_id):
 
 
 def cancel_booking(booking_id, lecturer_id):
-    """Cancel a booking - only if it actually belongs to this lecturer.
-    Checking lecturer_id in the WHERE clause (not just booking_id) stops
-    one lecturer from cancelling someone else's booking, even if they
-    guessed a valid booking ID."""
+    """Cancel a booking - only if it actually belongs to this lecturer, it's
+    still active, AND it hasn't already happened. Checking lecturer_id in
+    the WHERE clause (not just booking_id) stops one lecturer from
+    cancelling someone else's booking, even if they guessed a valid
+    booking ID. The brief specifically says lecturers can cancel FUTURE
+    bookings (section 6.1) - cancelling something whose date/time has
+    already passed doesn't really mean anything, so that's blocked here
+    rather than left to the GUI to enforce."""
     conn = get_connection()
     cursor = conn.cursor()
+
+    cursor.execute(
+        """SELECT booking_date, start_time FROM bookings
+           WHERE booking_id = ? AND lecturer_id = ? AND status = 'active'""",
+        (booking_id, lecturer_id),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        conn.close()
+        return False, "Booking not found or already cancelled."
+
+    booking_start = datetime.datetime.strptime(
+        f"{row['booking_date']} {row['start_time']}", "%Y-%m-%d %H:%M"
+    )
+    if booking_start <= datetime.datetime.now():
+        conn.close()
+        return False, "Can't cancel a booking that's already started or passed."
+
     cursor.execute(
         """UPDATE bookings SET status = 'cancelled'
            WHERE booking_id = ? AND lecturer_id = ? AND status = 'active'""",
@@ -488,18 +786,106 @@ def get_all_bookings():
 
 
 # ---------------------------------------------------------------------------
+# BOOKING STATE + LIVE AVAILABILITY (brief sections 6.1 and 6.2)
+# ---------------------------------------------------------------------------
+
+def booking_window(booking):
+    """Return (start, end) as real datetime objects for a booking row."""
+    start = datetime.datetime.strptime(
+        f"{booking['booking_date']} {booking['start_time']}", "%Y-%m-%d %H:%M"
+    )
+    return start, start + datetime.timedelta(minutes=booking["duration_minutes"])
+
+
+def booking_state(booking):
+    """What a booking actually IS right now, which the raw 'status' column
+    can't say on its own (status only knows 'active' or 'cancelled', so a
+    booking from last month would still read 'active').
+
+    Returns one of: 'Cancelled', 'Past', 'In progress', 'Upcoming'.
+    'Upcoming' + 'In progress' together are the bookings still worth
+    showing under "active bookings"; 'Past' is the booking history."""
+    if booking["status"] == "cancelled":
+        return "Cancelled"
+    start, end = booking_window(booking)
+    now = datetime.datetime.now()
+    if end <= now:
+        return "Past"
+    if start <= now:
+        return "In progress"
+    return "Upcoming"
+
+
+def get_resource_schedule(resource_id):
+    """Every active booking for one resource that hasn't finished yet, soonest
+    first - i.e. the slots a lecturer can NOT book. Each entry is a small dict
+    (date / start / end / minutes / in_progress) ready for the GUI to show."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """SELECT * FROM bookings
+           WHERE resource_id = ? AND status = 'active' AND booking_date >= ?
+           ORDER BY booking_date, start_time""",
+        (resource_id, datetime.date.today().isoformat()),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    now = datetime.datetime.now()
+    schedule = []
+    for booking in rows:
+        start, end = booking_window(booking)
+        if end <= now:
+            continue  # already over - nothing left to block
+        schedule.append({
+            "date": booking["booking_date"],
+            "start": start.strftime("%H:%M"),
+            "end": end.strftime("%H:%M"),
+            "minutes": booking["duration_minutes"],
+            "in_progress": start <= now,
+        })
+    return schedule
+
+
+def get_resources_in_use_now(campus_id):
+    """Which resources at this campus are being used at this very moment.
+    Returns {resource_id: 'HH:MM' time it becomes free} - anything not in the
+    dict is free right now. This is the 'real-time availability' the GUI
+    shows next to each resource."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """SELECT * FROM bookings
+           WHERE campus_id = ? AND status = 'active' AND booking_date = ?""",
+        (campus_id, datetime.date.today().isoformat()),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    now = datetime.datetime.now()
+    in_use = {}
+    for booking in rows:
+        start, end = booking_window(booking)
+        if start <= now < end:
+            in_use[booking["resource_id"]] = end.strftime("%H:%M")
+    return in_use
+
+
+# ---------------------------------------------------------------------------
 # REPORTS
 # ---------------------------------------------------------------------------
 
 def get_campus_report(campus_id):
-    """Total bookings, most-used resource, and average duration for one campus
-    (for the Campus Administrator)."""
+    """Total bookings, most frequently used resources, and average duration
+    for one campus (for the Campus Administrator - brief section 7.1)."""
     conn = get_connection()
     cursor = conn.cursor()
 
     cursor.execute("SELECT COUNT(*) FROM bookings WHERE campus_id = ?", (campus_id,))
     total_bookings = cursor.fetchone()[0]
 
+    # the brief says "most frequently used resources" (plural), so this
+    # returns the top 3 as a list of (name, booking_count) pairs
     cursor.execute(
         """SELECT resources.name, COUNT(*) as booking_count
            FROM bookings
@@ -507,19 +893,27 @@ def get_campus_report(campus_id):
            WHERE bookings.campus_id = ?
            GROUP BY bookings.resource_id
            ORDER BY booking_count DESC
-           LIMIT 1""",
+           LIMIT 3""",
         (campus_id,),
     )
-    most_used = cursor.fetchone()
+    top_resources = [(row["name"], row["booking_count"]) for row in cursor.fetchall()]
 
     cursor.execute("SELECT AVG(duration_minutes) FROM bookings WHERE campus_id = ?", (campus_id,))
     avg_duration = cursor.fetchone()[0]
 
+    # A Python set only keeps each value once, so putting every booking's
+    # lecturer_id into one gives the number of DIFFERENT lecturers who have
+    # booked here, not just the number of bookings.
+    cursor.execute("SELECT lecturer_id FROM bookings WHERE campus_id = ?", (campus_id,))
+    unique_lecturers = len({row["lecturer_id"] for row in cursor.fetchall()})
+
     conn.close()
     return {
         "total_bookings": total_bookings,
-        "most_used_resource": most_used["name"] if most_used else "No bookings yet",
+        "most_used_resource": top_resources[0][0] if top_resources else "No bookings yet",
+        "top_resources": top_resources,
         "avg_duration": round(avg_duration, 1) if avg_duration else 0,
+        "unique_lecturers": unique_lecturers,
     }
 
 
