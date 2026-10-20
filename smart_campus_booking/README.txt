@@ -182,4 +182,6 @@ THINGS IT DOES NOT DO
 Resources Used
 -----------------------
 
-
+channel = Bro-code - title = python tkinter tutorial for beginners
+playlist = https://youtube.com/playlist?list=PLZPZq0r_RZOOeQBaP5SeMjl2nwDcJaV0T&si=zV26nl74txWWi99l
+website = geeksforgeeks  - https://www.geeksforgeeks.org/python/python-gui-tkinter/
